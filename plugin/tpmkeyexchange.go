@@ -51,6 +51,13 @@ func (t *TPMKeyExchange) ECDH(remoteKey *ecdh.PublicKey) ([]byte, error) {
 	// Add the AuthSession for the handle
 	handle.Auth = tpm2.PasswordAuth(t.pin)
 
+	return ecdhZGen(t.tpm, srkHandle, srkPublic, handle, remoteKey)
+}
+
+// ecdhZGen computes the ECDH shared secret (the x-coordinate) between the
+// loaded key handle and remoteKey. The SRK is used to salt the session that
+// encrypts the response.
+func ecdhZGen(tpm transport.TPM, srkHandle *tpm2.AuthHandle, srkPublic *tpm2.TPMTPublic, handle *tpm2.AuthHandle, remoteKey *ecdh.PublicKey) ([]byte, error) {
 	p, err := nistec.NewP256Point().SetBytes(remoteKey.Bytes())
 	if err != nil {
 		return nil, err
@@ -73,12 +80,12 @@ func (t *TPMKeyExchange) ECDH(remoteKey *ecdh.PublicKey) ([]byte, error) {
 	// Execute the ECDHZGen command, we also add session encryption.
 	// In this case the session encryption only encrypts the private part going out of the TPM, which is the shared
 	// session key we are using in our kdf.
-	ecdhRsp, err := ecdh.Execute(t.tpm,
+	ecdhRsp, err := ecdh.Execute(tpm,
 		tpm2.HMAC(tpm2.TPMAlgSHA256, 16,
 			tpm2.AESEncryption(128, tpm2.EncryptOut),
 			tpm2.Salted(srkHandle.Handle, *srkPublic)))
 	if err != nil {
-		return nil, fmt.Errorf("failed ecdhzgen: %v", err)
+		return nil, fmt.Errorf("failed ecdhzgen: %w", err)
 	}
 
 	shared, err := ecdhRsp.OutPoint.Contents()

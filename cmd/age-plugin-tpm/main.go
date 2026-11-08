@@ -2,10 +2,14 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"filippo.io/age"
 	page "filippo.io/age/plugin"
@@ -26,6 +30,12 @@ type PluginOptions struct {
 	LogFile           string
 	OldStyleRecipient bool
 	PIN               bool
+	Agent             bool
+	AgentSocket       string
+	AgentTimeout      time.Duration
+	Unlock            string
+	Lock              bool
+	AgentStatus       bool
 }
 
 var example = `
@@ -154,7 +164,99 @@ func RunCli(cmd *cobra.Command, tpm transport.TPMCloser, in io.Reader, out io.Wr
 	return nil
 }
 
+func agentSocket() string {
+	if pluginOptions.AgentSocket != "" {
+		return pluginOptions.AgentSocket
+	}
+	return plugin.DefaultAgentSocket()
+}
+
+// RunAgent serves the unlock agent until SIGINT or SIGTERM.
+func RunAgent() error {
+	if err := plugin.HardenProcess(); err != nil {
+		return fmt.Errorf("failed hardening process: %v", err)
+	}
+	tpm, err := plugin.NewTPM("")
+	if err != nil {
+		return err
+	}
+	defer tpm.Close()
+
+	l, cleanup, err := plugin.AgentListener(agentSocket())
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	agent := plugin.NewAgent(tpm, pluginOptions.AgentTimeout)
+	defer agent.Close()
+
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigs
+		l.Close()
+	}()
+	return agent.Serve(l)
+}
+
+// RunUnlock reads the PIN for the identity file and hands it to the agent.
+func RunUnlock(file string) error {
+	f, err := os.Open(file)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	identity, err := plugin.ParseIdentity(f)
+	if err != nil {
+		return err
+	}
+	if !identity.HasPIN() {
+		return nil
+	}
+	agent := plugin.NewAgentClient(agentSocket())
+	for attempt := 1; ; attempt++ {
+		var pin []byte
+		envPIN := os.Getenv("AGE_TPM_PIN")
+		switch {
+		case envPIN != "":
+			pin = []byte(envPIN)
+		case term.IsTerminal(int(os.Stdin.Fd())):
+			pin, err = GetPin("Enter pin for key:")
+			fmt.Fprintln(os.Stderr)
+		default:
+			pin, err = GetPinPinentry("Unlock the age TPM identity "+file, "PIN:")
+		}
+		if err != nil {
+			return err
+		}
+		err = agent.Unlock(identity, pin)
+		clear(pin)
+		if errors.Is(err, plugin.ErrAgentBadPassword) && attempt < 2 && envPIN == "" {
+			fmt.Fprintln(os.Stderr, "Incorrect PIN, try again.")
+			continue
+		}
+		return err
+	}
+}
+
 func RunPlugin(cmd *cobra.Command, args []string) error {
+	switch {
+	case pluginOptions.Agent:
+		return RunAgent()
+	case pluginOptions.Unlock != "":
+		return RunUnlock(pluginOptions.Unlock)
+	case pluginOptions.Lock:
+		return plugin.NewAgentClient(agentSocket()).Lock()
+	case pluginOptions.AgentStatus:
+		n, err := plugin.NewAgentClient(agentSocket()).Status()
+		if err != nil {
+			return err
+		}
+		fmt.Printf("%d identities unlocked\n", n)
+		return nil
+	}
+
 	switch pluginOptions.AgePlugin {
 	case "recipient-v1":
 		plugin.Log.Println("Got recipient-v1")
@@ -174,11 +276,22 @@ func RunPlugin(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("age-plugin exited with code %d", exitCode)
 		}
 	case "identity-v1":
-		tpm, err := plugin.NewTPM("")
-		if err != nil {
-			return err
+		var agent *plugin.AgentClient
+		if os.Getenv("AGE_PLUGIN_NO_AGENT") == "" {
+			if c := plugin.NewAgentClient(plugin.DefaultAgentSocket()); c.Available() {
+				agent = c
+			}
 		}
-		defer tpm.Close()
+		// With an agent the plugin doesn't need TPM access itself.
+		var tpm transport.TPMCloser
+		if agent == nil {
+			var err error
+			tpm, err = plugin.NewTPM("")
+			if err != nil {
+				return err
+			}
+			defer tpm.Close()
+		}
 		plugin.Log.Println("Got identity-v1")
 		p, err := page.New("tpm")
 		if err != nil {
@@ -205,6 +318,9 @@ func RunPlugin(cmd *cobra.Command, args []string) error {
 					return pin, nil
 				},
 			)
+			if agent != nil {
+				i.UseAgent(agent)
+			}
 			return i, nil
 		})
 		os.Exit(p.Main())
@@ -240,6 +356,14 @@ func pluginFlags(cmd *cobra.Command, opts *PluginOptions) {
 
 	// Debug or logging stuff
 	flags.StringVar(&pluginOptions.LogFile, "log-file", "", "Logging file for debug output")
+
+	// Unlock agent
+	flags.BoolVar(&pluginOptions.Agent, "agent", false, "Run the unlock agent, which caches PINs until it stops or --lock.")
+	flags.StringVar(&pluginOptions.AgentSocket, "socket", "", "Agent socket path (default $AGE_PLUGIN_TPM_AGENT_SOCK or $XDG_RUNTIME_DIR/age-plugin-tpm/agent.sock).")
+	flags.DurationVar(&pluginOptions.AgentTimeout, "timeout", 0, "Forget cached PINs this long after unlocking (default: never).")
+	flags.StringVar(&pluginOptions.Unlock, "unlock", "", "Unlock the identity file in the agent.")
+	flags.BoolVar(&pluginOptions.Lock, "lock", false, "Make the agent forget all cached PINs.")
+	flags.BoolVar(&pluginOptions.AgentStatus, "agent-status", false, "Show how many identities the agent has unlocked.")
 
 	// Old style recipient
 	flags.BoolVar(&pluginOptions.OldStyleRecipient, "tpm-recipient", false, "Use the old-style tpm recipient instead of the new p256tag recipient.")

@@ -14,6 +14,7 @@ import (
 	"filippo.io/age"
 	"filippo.io/age/plugin"
 	"filippo.io/age/tag"
+	hpkeecdh "filippo.io/hpke/crypto/ecdh"
 	"github.com/google/go-tpm/tpm2"
 	"github.com/google/go-tpm/tpm2/transport"
 )
@@ -49,6 +50,7 @@ type Identity struct {
 	p         *plugin.Plugin
 	tpm       transport.TPMCloser
 	pin       func() ([]byte, error)
+	agent     *AgentClient
 }
 
 var _ age.Identity = &Identity{}
@@ -57,13 +59,37 @@ func (i *Identity) checktpm() bool {
 	// We need to check if we have passed a hw device
 	// TODO: Figure out a better relationship between identities
 	// identity -> TPM enabled identity -> ( TPMTagIdentity || TPMIdentity )
-	return i.tpm == nil
+	return i.tpm == nil && i.agent == nil
 }
 
 func (i *Identity) Callbacks(plugin *plugin.Plugin, tpm transport.TPMCloser, pin func() ([]byte, error)) {
 	i.p = plugin
 	i.tpm = tpm
 	i.pin = pin
+}
+
+// UseAgent routes key agreements through the unlock agent instead of
+// accessing the TPM directly. The pin callback is only used when the agent
+// reports that the key is locked.
+func (i *Identity) UseAgent(agent *AgentClient) {
+	i.agent = agent
+}
+
+// keyExchanger returns the agent-backed key exchange when an agent is in use,
+// and otherwise a direct TPM key exchange, asking for the PIN if needed.
+func (i *Identity) keyExchanger(tpm transport.TPMCloser, pin func() ([]byte, error)) (hpkeecdh.KeyExchanger, error) {
+	if i.agent != nil {
+		return NewAgentKeyExchange(i.agent, i, pin), nil
+	}
+	var p []byte
+	if i.HasPIN() {
+		var err error
+		p, err = pin()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get pin: %v", err)
+		}
+	}
+	return NewTPMKeyExchange(tpm, p, i), nil
 }
 
 func (i *Identity) Unwrap(stanzas []*age.Stanza) (fileKey []byte, err error) {
@@ -117,7 +143,8 @@ func (i *Identity) HasPIN() bool {
 	return i.PIN == HasPIN
 }
 
-func (i *Identity) String() string {
+// Bytes returns the serialized identity, the payload of the bech32 encoding.
+func (i *Identity) Bytes() []byte {
 	var b bytes.Buffer
 	for _, v := range i.Serialize() {
 		binary.Write(&b, binary.BigEndian, v)
@@ -131,7 +158,11 @@ func (i *Identity) String() string {
 	}
 	b.Write(pub)
 
-	return plugin.EncodeIdentity(PluginName, b.Bytes())
+	return b.Bytes()
+}
+
+func (i *Identity) String() string {
+	return plugin.EncodeIdentity(PluginName, i.Bytes())
 }
 
 func DecodeIdentity(s string) (*Identity, error) {

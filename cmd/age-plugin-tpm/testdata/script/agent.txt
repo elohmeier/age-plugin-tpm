@@ -1,0 +1,40 @@
+# Decrypt through the unlock agent: the PIN is entered once, at unlock.
+[!exec:sleep] skip
+env AGE_PLUGIN_TPM_AGENT_SOCK=$SOCKDIR/s/agent.sock
+env AGE_TPM_PIN=1234
+exec age-plugin-tpm --generate --pin -o identity.txt
+exec age-plugin-tpm -y identity.txt -o recipient.txt
+stdin input.txt
+exec age -R recipient.txt -o secret.age
+
+exec age-plugin-tpm --agent &agent&
+exec sleep 1
+exec age-plugin-tpm --agent-status
+stdout '0 identities unlocked'
+exec age-plugin-tpm --unlock identity.txt
+exec age-plugin-tpm --agent-status
+stdout '1 identities unlocked'
+
+# No PIN in the environment: the agent supplies the authorization.
+env AGE_TPM_PIN=
+stdin secret.age
+exec age -d -i identity.txt
+stdout 'Hello World'
+
+exec age-plugin-tpm --lock
+exec age-plugin-tpm --agent-status
+stdout '0 identities unlocked'
+
+# Without the agent the plugin uses the TPM directly.
+env AGE_PLUGIN_NO_AGENT=1
+env AGE_TPM_PIN=1234
+stdin secret.age
+exec age -d -i identity.txt
+stdout 'Hello World'
+
+kill -INT agent
+wait agent
+! exists $SOCKDIR/s/agent.sock
+
+-- input.txt --
+Hello World

@@ -49,14 +49,6 @@ func (t *TPMIdentity) unwrap(block *age.Stanza) ([]byte, error) {
 		return nil, age.ErrIncorrectIdentity
 	}
 
-	var pin []byte
-	if t.identity.HasPIN() {
-		pin, err = t.pin()
-		if err != nil {
-			return nil, fmt.Errorf("failed to get pin: %v", err)
-		}
-	}
-
 	p, err := nistec.NewP256Point().SetBytes(sessionKey)
 	if err != nil {
 		return nil, err
@@ -66,7 +58,10 @@ func (t *TPMIdentity) unwrap(block *age.Stanza) ([]byte, error) {
 		return nil, err
 	}
 
-	exchange := NewTPMKeyExchange(t.tpm, pin, t.identity)
+	exchange, err := t.identity.keyExchanger(t.tpm, t.pin)
+	if err != nil {
+		return nil, err
+	}
 	sharedSecret, err := exchange.ECDH(sessionKeyECDH)
 	if err != nil {
 		return nil, err

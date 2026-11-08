@@ -53,21 +53,18 @@ func (t *TPMTagIdentity) unwrap(block *age.Stanza) ([]byte, error) {
 	if subtle.ConstantTimeCompare(tag, itag) != 1 {
 		return nil, age.ErrIncorrectIdentity
 	}
-	var pin []byte
-	if t.identity.HasPIN() {
-		pin, err = t.pin()
-		if err != nil {
-			return nil, fmt.Errorf("failed to get pin: %v", err)
-		}
+	kex, err := t.identity.keyExchanger(t.tpm, t.pin)
+	if err != nil {
+		return nil, err
 	}
 
-	k, err := hpke.NewDHKEMPrivateKey(NewTPMKeyExchange(t.tpm, pin, t.identity))
+	k, err := hpke.NewDHKEMPrivateKey(kex)
 	if err != nil {
-		return nil, fmt.Errorf("failed to unwrap file key: %v", err)
+		return nil, fmt.Errorf("failed to unwrap file key: %w", err)
 	}
 	r, err := hpke.NewRecipient(sessionKey, k, hpke.HKDFSHA256(), hpke.ChaCha20Poly1305(), []byte("age-encryption.org/p256tag"))
 	if err != nil {
-		return nil, fmt.Errorf("failed to unwrap file key: %v", err)
+		return nil, fmt.Errorf("failed to unwrap file key: %w", err)
 	}
 	return r.Open(nil, block.Body)
 }

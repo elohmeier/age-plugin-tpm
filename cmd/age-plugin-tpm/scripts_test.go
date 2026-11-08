@@ -35,7 +35,13 @@ func TestPlugin(t *testing.T) {
 	testscript.Run(t, testscript.Params{
 		Dir: "testdata/script",
 		Setup: func(e *testscript.Env) error {
-			e.Vars = append(e.Vars, "_AGE_TPM_SIMULATOR=1")
+			// $WORK can exceed the unix socket path limit on macOS.
+			sockDir, err := os.MkdirTemp("", "agt")
+			if err != nil {
+				return err
+			}
+			e.Defer(func() { os.RemoveAll(sockDir) })
+			e.Vars = append(e.Vars, "_AGE_TPM_SIMULATOR=1", "SOCKDIR="+sockDir)
 			return nil
 		},
 	})
