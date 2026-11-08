@@ -50,6 +50,50 @@ $ AGE_TPM_PIN=1234 age --decrypt -i age-identity.txt -o - test-decrypt.txt
 Hack The Planet!
 ```
 
+### Unlock agent
+
+With `--pin`, every decryption asks for the PIN. The agent caches the PIN after the first
+unlock, so you enter it once per session:
+
+```bash
+# Run the agent, e.g. as a systemd user service
+$ age-plugin-tpm --agent &
+
+# Unlock now, or let the first decryption ask for the PIN
+$ age-plugin-tpm --unlock age-identity.txt
+Enter pin for key:
+
+# Decryption no longer asks for the PIN
+$ age --decrypt -i age-identity.txt -o - test-decrypt.txt
+Hack The Planet!
+
+# Forget the PIN again, e.g. before suspend
+$ age-plugin-tpm --lock
+```
+
+The key stays in the TPM; the agent only holds the PIN, in memory that is excluded from swap
+and core dumps. Use `--timeout 8h` to forget the PIN after a while. The plugin finds the agent
+at `$XDG_RUNTIME_DIR/age-plugin-tpm/agent.sock` (override with `AGE_PLUGIN_TPM_AGENT_SOCK`)
+and falls back to asking for the PIN when no agent is running. See [AGENT.md](AGENT.md) for
+the protocol.
+
+Example systemd user units:
+
+```ini
+# ~/.config/systemd/user/age-plugin-tpm-agent.socket
+[Socket]
+ListenStream=%t/age-plugin-tpm/agent.sock
+SocketMode=0600
+DirectoryMode=0700
+
+[Install]
+WantedBy=sockets.target
+
+# ~/.config/systemd/user/age-plugin-tpm-agent.service
+[Service]
+ExecStart=/usr/bin/age-plugin-tpm --agent
+```
+
 ## Commands
 
 An age identity can be created with:
