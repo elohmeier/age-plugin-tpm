@@ -5,9 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"io/fs"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -74,18 +75,23 @@ func SetLogger() {
 	plugin.SetLogger(w)
 }
 
-func clearLine(out io.Writer) {
-	const (
-		CUI = "\033["   // Control Sequence Introducer
-		CPL = CUI + "F" // Cursor Previous Line
-		EL  = CUI + "K" // Erase in Line
-	)
-	fmt.Fprintf(out, "\r\n"+CPL+EL)
-}
-
 func GetPin(prompt string) ([]byte, error) {
 	fmt.Fprintf(os.Stderr, "%s ", prompt)
+	defer fmt.Fprintln(os.Stderr)
 	return term.ReadPassword(int(os.Stdin.Fd()))
+}
+
+// createOutputFile creates a new private output file, and its directory if
+// needed, so that a generated key is never lost to a missing directory.
+func createOutputFile(path string) (*os.File, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if errors.Is(err, fs.ErrExist) {
+		return nil, fmt.Errorf("output file %s already exists", path)
+	}
+	return f, err
 }
 
 func RunCli(cmd *cobra.Command, tpm transport.TPMCloser, in io.Reader, out io.Writer) error {
@@ -93,6 +99,22 @@ func RunCli(cmd *cobra.Command, tpm transport.TPMCloser, in io.Reader, out io.Wr
 	var err error
 	switch {
 	case pluginOptions.Generate:
+		// Create the output file before asking for a PIN, so that problems
+		// with it are reported first.
+		var outputFile *os.File
+		if pluginOptions.OutputFile != "" && pluginOptions.OutputFile != "-" {
+			outputFile, err = createOutputFile(pluginOptions.OutputFile)
+			if err != nil {
+				return err
+			}
+			defer func() {
+				outputFile.Close()
+				if err != nil {
+					os.Remove(outputFile.Name())
+				}
+			}()
+			out = outputFile
+		}
 
 		if pluginOptions.PIN {
 			if s := os.Getenv("AGE_TPM_PIN"); s != "" {
@@ -102,29 +124,22 @@ func RunCli(cmd *cobra.Command, tpm transport.TPMCloser, in io.Reader, out io.Wr
 				if err != nil {
 					return err
 				}
-
-				clearLine(os.Stdin)
-
-				confirm, err := GetPin("Confirm pin:")
+				var confirm []byte
+				confirm, err = GetPin("Confirm pin:")
 				if err != nil {
 					return err
 				}
 				if !bytes.Equal(pin, confirm) {
-					return fmt.Errorf("pins didn't match")
+					err = fmt.Errorf("pins didn't match")
+					return err
 				}
 			}
 		}
-		if pluginOptions.OutputFile != "" && pluginOptions.OutputFile != "-" {
-			f, err := os.OpenFile(pluginOptions.OutputFile, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-			if err != nil {
-				return err
-			}
-			defer f.Close()
-			out = f
-		}
 
 		var rcp fmt.Stringer
-		identity, recipient, err := plugin.CreateIdentity(tpm, pin)
+		var identity *plugin.Identity
+		var recipient fmt.Stringer
+		identity, recipient, err = plugin.CreateIdentity(tpm, pin)
 		if err != nil {
 			return err
 		}
@@ -134,6 +149,9 @@ func RunCli(cmd *cobra.Command, tpm transport.TPMCloser, in io.Reader, out io.Wr
 		}
 		if err = plugin.MarshalIdentity(identity, rcp, out); err != nil {
 			return err
+		}
+		if outputFile != nil {
+			fmt.Fprintf(os.Stderr, "Public key: %s\n", rcp)
 		}
 	case pluginOptions.Convert:
 		if pluginOptions.OutputFile != "" && pluginOptions.OutputFile != "-" {
@@ -380,7 +398,10 @@ func pluginFlags(cmd *cobra.Command, opts *PluginOptions) {
 func main() {
 	SetLogger()
 	pluginFlags(rootCmd, &pluginOptions)
+	rootCmd.SilenceUsage = true
+	rootCmd.SilenceErrors = true
 	if err := rootCmd.Execute(); err != nil {
-		log.Fatal(err)
+		fmt.Fprintf(os.Stderr, "age-plugin-tpm: error: %v\n", err)
+		os.Exit(1)
 	}
 }
